@@ -1,23 +1,22 @@
-05:47:52  events=36
-05:47:55  GET https://api.elections.kalshi.com/trade-api/v2/markets?event_ticker=KXRIEMANNRES-40&limit=200 -> HTTP Error 429: Too Many Requests
-05:47:57  GET https://api.elections.kalshi.com/trade-api/v2/markets?event_ticker=KXU3EOY-37JAN09&limit=200 -> HTTP Error 429: Too Many Requests
-05:47:59  prices done events=36 contracts=159
-05:47:59  history start contracts=40
-05:48:00  GET https://api.elections.kalshi.com/trade-api/v2/series/KXRIEMANNRES/markets/KXRIEMANNRES-40-28JAN01/candlesticks?start_ts=1794635279&end_ts=1795240079&period_interval=60 -> HTTP Error 429: Too Many Requests
-05:48:02  GET https://api.elections.kalshi.com/trade-api/v2/series/KXMILLENNIUMALL/markets/KXMILLENNIUMALL-40-28JAN01/candlesticks?start_ts=1790056079&end_ts=1795240079&period_interval=1440 -> HTTP Error 429: Too Many Requests
-05:48:04  GET https://api.elections.kalshi.com/trade-api/v2/series/KXRIEMANNRES/markets/KXRIEMANNRES-40-35JAN01/candlesticks?start_ts=1790056079&end_ts=1795240079&period_interval=1440 -> HTTP Error 429: Too Many Requests
-05:48:06    10/40
-05:48:07  GET https://api.elections.kalshi.com/trade-api/v2/series/KXMILLENNIUMNEXT/markets/KXMILLENNIUMNEXT-45-HODGE/candlesticks?start_ts=1790056079&end_ts=1795240079&period_interval=1440 -> HTTP Error 429: Too Many Requests
-05:48:09  GET https://api.elections.kalshi.com/trade-api/v2/series/KXELONMARS/markets/KXELONMARS-99/candlesticks?start_ts=1795153679&end_ts=1795240079&period_interval=1 -> HTTP Error 429: Too Many Requests
-05:48:11  GET https://api.elections.kalshi.com/trade-api/v2/series/KXNEXTISRAELPM/markets/KXNEXTISRAELPM-45JAN01-NBEN/candlesticks?start_ts=1790056079&end_ts=1795240079&period_interval=1440 -> HTTP Error 429: Too Many Requests
-05:48:13    20/40
-05:48:14  GET https://api.elections.kalshi.com/trade-api/v2/series/KXCOLONIZEMARS/markets/KXCOLONIZEMARS-50/candlesticks?start_ts=1795153679&end_ts=1795240079&period_interval=1 -> HTTP Error 429: Too Many Requests
-05:48:16  GET https://api.elections.kalshi.com/trade-api/v2/series/KXMILLENNIUMNEXT/markets/KXMILLENNIUMNEXT-45-PNP/candlesticks?start_ts=1795153679&end_ts=1795240079&period_interval=1 -> HTTP Error 429: Too Many Requests
-05:48:18  GET https://api.elections.kalshi.com/trade-api/v2/series/KXXISUCCESSOR/markets/KXXISUCCESSOR-45JAN01-YLI/candlesticks?start_ts=1795153679&end_ts=1795240079&period_interval=1 -> HTTP Error 429: Too Many Requests
-05:48:20  GET https://api.elections.kalshi.com/trade-api/v2/series/KXXISUCCESSOR/markets/KXXISUCCESSOR-45JAN01-CQI/candlesticks?start_ts=1795153679&end_ts=1795240079&period_interval=1 -> HTTP Error 429: Too Many Requests
-05:48:22    30/40
-05:48:23  GET https://api.elections.kalshi.com/trade-api/v2/series/KXWCCAREERGOALS/markets/KXWCCAREERGOALS-KMBAPPE-35/candlesticks?start_ts=1795153679&end_ts=1795240079&period_interval=1 -> HTTP Error 429: Too Many Requests
-05:48:25  GET https://api.elections.kalshi.com/trade-api/v2/series/KXUSCPIYEAR/markets/KXUSCPIYEAR-37FEB01-T3.0/candlesticks?start_ts=1795153679&end_ts=1795240079&period_interval=1 -> HTTP Error 429: Too Many Requests
-05:48:27  GET https://api.elections.kalshi.com/trade-api/v2/series/KXUSCPIYEAR/markets/KXUSCPIYEAR-37FEB01-T1.5/candlesticks?start_ts=1790056079&end_ts=1795240079&period_interval=1440 -> HTTP Error 429: Too Many Requests
-05:48:29    40/40
-05:48:29  history done 40/40
+05:55:10  history start contracts=20
+05:55:11  empty KXGDPYEAR-33-B2.8
+05:55:12  empty KXDEELRIP-40-DEEL
+05:55:13  empty KXDEELRIP-40-RIPP
+05:55:15  empty KXPRODCAGR-32FEB05-T3.0
+05:55:16  empty KXNEXTTRILLIONAIRE-33-WB
+05:55:17  empty KXNEXTTRILLIONAIRE-33-SRB
+05:55:18  empty KXNEXTTRILLIONAIRE-33-SB
+05:55:19  empty KXNEXTTRILLIONAIRE-33-SA
+05:55:21  empty KXNEXTTRILLIONAIRE-33-LE
+05:55:22  empty KXNEXTTRILLIONAIRE-33-BA
+05:55:23  empty KXUSCPIYEAR-37FEB01-T4.5
+05:55:24  empty KXUSCPIYEAR-37FEB01-T3.0
+05:55:26  empty KXUSCPIYEAR-37FEB01-T2.0
+05:55:27  empty KXUSCPIYEAR-37FEB01-T1.5
+05:55:28  empty KXUSCPIYEAR-37FEB01-T1.0
+05:55:29  empty KXUSCPIYEAR-37FEB01-T0.5
+05:55:30  empty KXUSCPIYEAR-36FEB01-T6.0
+05:55:32  empty KXUSCPIYEAR-36FEB01-T3.0
+05:55:33  empty KXUSCPIYEAR-36FEB01-T1.5
+05:55:34  empty KXUSCPIYEAR-36FEB01-T1.0
+05:55:34  history done 0/20
