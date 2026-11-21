@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""Polymarket 取数（在 GitHub Actions 里跑，境外网络）。
+"""Kalshi 取数（在 GitHub Actions 里跑，境外网络）。
 
 用法：
-    python3 fetch_pm.py prices    # 抓事件 + 当前概率 → data/pm.json
-    python3 fetch_pm.py history   # 抓合约走势       → data/history/<id>.json
+    python3 fetch_pm.py prices    # 事件 + 当前概率 → data/pm.json
+    python3 fetch_pm.py history   # 合约走势        → data/history/<ticker>.json
 
-只依赖标准库。所有接口都是 Polymarket 的公开只读接口：
-    gamma-api.polymarket.com/events     事件与市场元数据（含 oneDayPriceChange）
-    clob.polymarket.com/prices-history  单个 token 的历史价格
+为什么换成 Kalshi：Polymarket 的 gamma/clob 对机房 IP 有拦截
+（GitHub 的 runner 直接被拒），Kalshi 是 CFTC 监管的交易所，公共读接口开放。
+
+只依赖标准库。接口：
+    /trade-api/v2/events                                事件元数据（category/title）
+    /trade-api/v2/markets?event_ticker=                 该事件下的合约与报价
+    /trade-api/v2/series/{s}/markets/{t}/candlesticks   历史 K 线
 """
 
 import calendar
@@ -16,50 +20,52 @@ import json
 import os
 import sys
 import time
+import traceback
 import urllib.parse
 import urllib.request
 
-GAMMA = "https://gamma-api.polymarket.com"
-CLOB = "https://clob.polymarket.com"
-UA = {"User-Agent": "liquidity-radar-relay/1.0 (+https://github.com/)"}
+BASE = "https://api.elections.kalshi.com/trade-api/v2"
+UA = {"User-Agent": "liquidity-radar-relay/1.0 (+https://github.com/2297603524/pm-relay)",
+      "Accept": "application/json"}
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA = os.path.join(ROOT, "data")
 HIST = os.path.join(DATA, "history")
 
-# Polymarket 的 tag slug → 我们的类别
-TAG_CAT = {
-    "fed": "fomc", "fed-rates": "fomc", "interest-rates": "rates", "rates": "rates",
-    "economy": "macro", "inflation": "macro", "macro": "macro", "economic-policy": "macro",
-    "trade": "trade", "tariffs": "trade",
-    "commodities": "commodity", "oil": "commodity", "gold": "commodity",
-    "stocks": "equity", "equities": "equity", "business": "equity",
+# Kalshi 的 category → 我们的类别
+CAT_MAP = {
+    "economics": "macro", "financials": "rates", "fed": "fomc", "politics": "macro",
+    "companies": "equity", "climate": "commodity", "commodities": "commodity",
+    "world": "trade", "science and technology": "equity",
 }
 
-MAX_EVENTS = 60          # 最多保留多少个事件
-MAX_HISTORY = 80         # 历史只抓成交额前 N 个合约，避免一次几百个请求
+MAX_EVENTS = 36          # 最多保留多少个事件
+MAX_MARKETS = 6          # 每个事件最多取几个合约
+MAX_HISTORY = 40         # 历史只抓成交量前 N 个合约
 
 
-def get(url, timeout=25, tries=3):
+def _dbg(msg):
+    """把进度写到 data/_debug.txt，失败时也能从仓库里看到"""
+    try:
+        os.makedirs(DATA, exist_ok=True)
+        with open(os.path.join(DATA, "_debug.txt"), "a", encoding="utf-8") as f:
+            f.write(time.strftime("%H:%M:%S") + "  " + str(msg) + "\n")
+    except Exception:
+        pass
+
+
+def get(url, timeout=20, tries=3):
     last = None
     for i in range(tries):
         try:
             req = urllib.request.Request(url, headers=UA)
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                return json.loads(r.read().decode("utf-8"))
-        except Exception as e:                       # 网络抖动重试
+                raw = r.read().decode("utf-8", "ignore")
+            return json.loads(raw)
+        except Exception as e:
             last = e
-            time.sleep(1.5 * (i + 1))
-    raise RuntimeError("GET %s failed: %s" % (url, last))
-
-
-def jlist(v):
-    """gamma 里 outcomes / outcomePrices / clobTokenIds 都是 JSON 字符串"""
-    if isinstance(v, list):
-        return v
-    try:
-        return json.loads(v or "[]")
-    except Exception:
-        return []
+            _dbg("GET %s -> %s" % (url, str(e)[:120]))
+            time.sleep(1.2 * (i + 1))
+    raise RuntimeError("GET failed %s: %s" % (url, last))
 
 
 def fnum(v, default=0.0):
@@ -69,57 +75,75 @@ def fnum(v, default=0.0):
         return default
 
 
-def cat_of(event):
-    for tag in event.get("tags") or []:
-        slug = (tag.get("slug") or "").lower()
-        if slug in TAG_CAT:
-            return TAG_CAT[slug]
-    return "macro"
+def ts(iso):
+    if not iso:
+        return None
+    try:
+        return int(calendar.timegm(time.strptime(iso[:19], "%Y-%m-%dT%H:%M:%S")))
+    except Exception:
+        return None
+
+
+def cat_of(ev):
+    return CAT_MAP.get((ev.get("category") or "").strip().lower(), "macro")
+
+
+def mid_price(m):
+    """买一/卖一的中点；没有报价就退到最新成交价"""
+    bid = fnum(m.get("yes_bid_dollars"))
+    ask = fnum(m.get("yes_ask_dollars"))
+    if bid > 0 and ask > 0:
+        return round((bid + ask) / 2, 4)
+    last = fnum(m.get("last_price_dollars"))
+    return round(last, 4) if last > 0 else None
 
 
 def fetch_events():
-    url = ("%s/events?active=true&closed=false&limit=%d"
-           "&order=volume24hr&ascending=false" % (GAMMA, MAX_EVENTS))
-    evs = get(url)
+    d = get(BASE + "/events?status=open&limit=%d&with_nested_markets=false" % MAX_EVENTS)
+    evs = d.get("events") or []
+    _dbg("events=%d" % len(evs))
     out = []
-    now = int(time.time())
-    for e in evs:
+    for ev in evs:
+        ticker = ev.get("event_ticker") or ""
+        if not ticker:
+            continue
+        try:
+            md = get(BASE + "/markets?event_ticker=%s&limit=200" % urllib.parse.quote(ticker))
+        except Exception as e:
+            _dbg("markets %s -> %s" % (ticker, str(e)[:100]))
+            continue
         rows = []
-        for m in e.get("markets") or []:
-            if m.get("closed"):
+        for m in (md.get("markets") or [])[:MAX_MARKETS]:
+            if m.get("status") not in ("active", "open", "initialized"):
                 continue
-            prices = jlist(m.get("outcomePrices"))
-            outs = jlist(m.get("outcomes"))
-            if not prices:
+            p = mid_price(m)
+            if p is None or p <= 0:
                 continue
-            yes = fnum(prices[0])
-            label = m.get("groupItemTitle") or (outs[0] if outs else "")
-            chg = m.get("oneDayPriceChange")
             rows.append({
-                "id": str(m.get("id") or ""),
-                "label": label or "是",
-                "question": m.get("question") or "",
-                "rules": (m.get("description") or "")[:1200],
-                "price": round(yes, 4),
-                "change": None if chg is None else round(fnum(chg), 4),
-                "volume": fnum(m.get("volumeNum") or m.get("volume")),
-                "status": "open" if not m.get("closed") else "resolved",
-                "payout": None if not m.get("closed") else (1 if yes >= 0.99 else 0),
-                "end": int(calendar.timegm(time.strptime(m["endDate"][:19], "%Y-%m-%dT%H:%M:%S"))) if m.get("endDate") else e.get("endDate"),
+                "id": m.get("ticker") or "",
+                "label": m.get("yes_sub_title") or m.get("subtitle") or "",
+                "question": m.get("title") or "",
+                "rules": (m.get("rules_primary") or "")[:1200],
+                "price": p,
+                "change": None,
+                "volume": fnum(m.get("volume_24h_fp") or m.get("volume_fp")),
+                "status": "open",
+                "payout": None,
+                "end": ts(m.get("close_time")),
             })
         if not rows:
             continue
         out.append({
-            "id": str(e.get("id") or ""),
-            "slug": e.get("slug") or "",
-            "title": e.get("title") or "",
-            "original": e.get("title") or "",
-            "category": cat_of(e),
+            "id": ticker,
+            "slug": ticker,
+            "title": ev.get("title") or ticker,
+            "original": ev.get("title") or "",
+            "category": cat_of(ev),
             "status": "open",
-            "end": int(calendar.timegm(time.strptime(e["endDate"][:19], "%Y-%m-%dT%H:%M:%S"))) if e.get("endDate") else None,
-            "volume": fnum(e.get("volume")),
+            "end": rows[0]["end"],
+            "volume": sum(r["volume"] for r in rows),
             "note": "",
-            "checked_at": now,
+            "checked_at": int(time.time()),
             "rows": rows,
         })
     return out
@@ -132,18 +156,38 @@ def cmd_prices():
         "partial": False,
         "review": {"at": 0, "summary": ""},
         "events": events,
-        "source": "polymarket-gamma",
+        "source": "kalshi",
     }
     os.makedirs(DATA, exist_ok=True)
-    path = os.path.join(DATA, "pm.json")
-    with open(path, "w", encoding="utf-8") as f:
+    with open(os.path.join(DATA, "pm.json"), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, separators=(",", ":"))
     n = sum(len(e["rows"]) for e in events)
-    print("events=%d contracts=%d -> %s" % (len(events), n, path))
+    _dbg("prices done events=%d contracts=%d" % (len(events), n))
+    print("events=%d contracts=%d" % (len(events), n))
 
 
-def pick_contracts():
-    """按成交额取前 N 个合约 id，历史只抓这些"""
+def series_of(ticker):
+    """KXFEDDECISION-26DEC-C25 → KXFEDDECISION"""
+    return (ticker or "").split("-")[0]
+
+
+def candles(series, ticker, start, end, interval):
+    url = "%s/series/%s/markets/%s/candlesticks?start_ts=%d&end_ts=%d&period_interval=%d" % (
+        BASE, urllib.parse.quote(series), urllib.parse.quote(ticker), start, end, interval)
+    d = get(url)
+    pts = []
+    for c in d.get("candlesticks") or []:
+        t = c.get("end_period_ts")
+        pr = (c.get("price") or {}).get("close")
+        if t and pr is not None:
+            v = float(pr) / 100.0
+            if v > 0:
+                pts.append([int(t), round(v, 4)])
+    return pts
+
+
+def cmd_history():
+    os.makedirs(HIST, exist_ok=True)
     path = os.path.join(DATA, "pm.json")
     with open(path, encoding="utf-8") as f:
         d = json.load(f)
@@ -152,63 +196,41 @@ def pick_contracts():
         for r in e.get("rows") or []:
             items.append((r.get("volume") or 0, r.get("id")))
     items.sort(reverse=True)
-    return [i for _, i in items[:MAX_HISTORY] if i]
-
-
-def token_of(mid):
-    """市场 id → YES token id（clobTokenIds 第一个）"""
-    d = get("%s/markets?id=%s" % (GAMMA, urllib.parse.quote(mid)))
-    if isinstance(d, list) and d:
-        ids = jlist(d[0].get("clobTokenIds"))
-        if ids:
-            return str(ids[0])
-    return None
-
-
-def prices_history(token, interval, fidelity):
-    url = "%s/prices-history?market=%s&interval=%s&fidelity=%d" % (
-        CLOB, urllib.parse.quote(token), interval, fidelity)
-    d = get(url)
-    pts = []
-    for p in d.get("history") or []:
-        t, v = p.get("t"), p.get("p")
-        if t is not None and v is not None:
-            pts.append([int(t), round(float(v), 4)])
-    return pts
-
-
-def cmd_history():
-    os.makedirs(HIST, exist_ok=True)
-    ids = pick_contracts()
-    print("contracts to fetch:", len(ids))
+    ids = [i for _, i in items[:MAX_HISTORY] if i]
+    _dbg("history start contracts=%d" % len(ids))
+    now = int(time.time())
     ok = 0
-    for n, mid in enumerate(ids, 1):
+    for n, tk in enumerate(ids, 1):
         try:
-            tok = token_of(mid)
-            if not tok:
-                continue
-            minute = prices_history(tok, "1d", 5)
-            week = prices_history(tok, "1w", 30)
-            full = prices_history(tok, "max", 180)
+            s = series_of(tk)
+            minute = candles(s, tk, now - 86400, now, 1)
+            week = candles(s, tk, now - 7 * 86400, now, 60)
+            full = candles(s, tk, now - 60 * 86400, now, 1440)
             doc = {
-                "minute": minute, "minute_at": int(time.time()), "minute_end": int(time.time()),
+                "minute": minute, "minute_at": now, "minute_end": now,
                 "week": week, "month": full, "month_step": 1800,
-                "all": full, "all_at": int(time.time()), "all_end": int(time.time()),
-                "revision": ["open", int(time.time())],
+                "all": full, "all_at": now, "all_end": now,
+                "revision": ["open", now],
             }
-            with open(os.path.join(HIST, "%s.json" % mid), "w", encoding="utf-8") as f:
+            with open(os.path.join(HIST, "%s.json" % tk), "w", encoding="utf-8") as f:
                 json.dump(doc, f, ensure_ascii=False, separators=(",", ":"))
             ok += 1
         except Exception as e:
-            print("skip %s: %s" % (mid, str(e)[:80]))
+            _dbg("skip %s: %s" % (tk, str(e)[:90]))
         if n % 10 == 0:
-            print("  %d/%d" % (n, len(ids)))
+            _dbg("  %d/%d" % (n, len(ids)))
+    _dbg("history done %d/%d" % (ok, len(ids)))
     print("history written:", ok)
 
 
 if __name__ == "__main__":
     mode = sys.argv[1] if len(sys.argv) > 1 else "prices"
-    if mode == "history":
-        cmd_history()
-    else:
-        cmd_prices()
+    try:
+        if mode == "history":
+            cmd_history()
+        else:
+            cmd_prices()
+    except Exception:
+        _dbg("FATAL " + traceback.format_exc()[-1500:])
+        # 故意不抛出：让后面的 Commit 步骤仍然执行，把 _debug.txt 提交回来
+        print("failed, see data/_debug.txt")
