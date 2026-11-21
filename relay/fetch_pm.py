@@ -9,12 +9,11 @@
 为什么用 Kalshi：Polymarket 的 gamma/clob 对机房 IP 有拦截（GitHub runner 直接被拒），
 Kalshi 是 CFTC 监管的交易所，公共读接口开放，有真实成交价。
 
-只依赖标准库。接口：
-    /events                                事件元数据（category / title / event_ticker）
-    /markets?event_ticker=                 该事件下的合约与报价
-    /series/{s}/markets/{t}/candlesticks   历史 K 线
+策略：从**合约层**（/markets）翻页抓，按 24h 成交额分组到事件。
+这样能直接拿到 close_time 和成交量，不必逐个事件请求，也避免抓到一批
+到期在 2035 年、零成交的僵尸市场。
 
-注意 Kalshi 有频率限制（429）。所有请求串行 + 间隔 0.35s，遇到 429 按 Retry-After 退避。
+只依赖标准库。Kalshi 限流较紧：串行 + 间隔 0.35s，429 按 Retry-After 退避。
 """
 
 import calendar
@@ -34,14 +33,11 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA = os.path.join(ROOT, "data")
 HIST = os.path.join(DATA, "history")
 
-# 只要这三类：宏观数据 / 利率金融 / 公司
-KEEP_CATS = {"economics", "financials", "companies"}
-CAT_MAP = {"economics": "macro", "financials": "rates", "companies": "equity"}
-
 MAX_EVENTS = 24          # 最终保留多少个事件
 MAX_MARKETS = 6          # 每个事件最多取几个合约
 MAX_HISTORY = 20         # 历史只抓成交量前 N 个合约
-PACE = 0.35              # 每次请求之间的间隔（秒）
+PACE = 0.35              # 请求间隔（秒）
+SCAN_PAGES = 8           # 合约层翻多少页（每页 200）
 
 _DBG_STARTED = [False]
 
@@ -58,7 +54,6 @@ def _dbg(msg):
 
 
 def get(url, timeout=20, tries=5):
-    """带 429 退避的 GET：Kalshi 限流很紧，退避比快速重试有效"""
     last = None
     for i in range(tries):
         try:
@@ -75,7 +70,7 @@ def get(url, timeout=20, tries=5):
                 except Exception:
                     wait = 0
                 wait = max(wait, 4 * (i + 1))
-                _dbg("429 %s -> sleep %ds" % (url.split("/v2")[-1][:70], wait))
+                _dbg("429 -> sleep %ds" % wait)
                 time.sleep(wait)
                 continue
             _dbg("HTTP %s %s" % (e.code, url.split("/v2")[-1][:70]))
@@ -104,7 +99,6 @@ def ts(iso):
 
 
 def mid_price(m):
-    """买一/卖一的中点；没有双边报价就退到最新成交价"""
     bid = fnum(m.get("yes_bid_dollars"))
     ask = fnum(m.get("yes_ask_dollars"))
     if bid > 0 and ask > 0:
@@ -113,82 +107,97 @@ def mid_price(m):
     return round(last, 4) if last > 0 else None
 
 
-def list_events(pages=2):
-    """分页拉 open 事件，只保留宏观/利率/公司三类"""
-    out, cursor = [], None
+def scan_markets(pages=SCAN_PAGES):
+    """翻页抓 open 合约，返回按 event_ticker 分组的字典"""
+    groups, cursor, total = {}, None, 0
     for _ in range(pages):
-        url = BASE + "/events?status=open&limit=200&with_nested_markets=false"
+        url = BASE + "/markets?status=open&limit=200"
         if cursor:
             url += "&cursor=" + urllib.parse.quote(cursor)
         d = get(url)
-        for ev in d.get("events") or []:
-            cat = (ev.get("category") or "").strip().lower()
-            if cat in KEEP_CATS:
-                out.append(ev)
+        batch = d.get("markets") or []
+        total += len(batch)
+        for m in batch:
+            et = m.get("event_ticker") or ""
+            if not et or m.get("status") not in ("active", "open", "initialized"):
+                continue
+            p = mid_price(m)
+            if p is None or p <= 0:
+                continue
+            m["_p"] = p
+            m["_vol"] = fnum(m.get("volume_24h_fp") or m.get("volume_fp"))
+            groups.setdefault(et, []).append(m)
         cursor = d.get("cursor")
         if not cursor:
             break
-    _dbg("macro events=%d" % len(out))
-    return out
+    _dbg("scanned markets=%d events=%d" % (total, len(groups)))
+    return groups
 
 
-def build_event(ev):
-    ticker = ev.get("event_ticker") or ""
-    if not ticker:
-        return None
+def event_meta(ticker):
+    """事件元数据；失败就返回空，不影响主流程"""
     try:
-        md = get(BASE + "/markets?event_ticker=%s&limit=200" % urllib.parse.quote(ticker))
-    except Exception as e:
-        _dbg("markets %s -> %s" % (ticker, str(e)[:80]))
-        return None
-    rows = []
-    for m in (md.get("markets") or [])[:MAX_MARKETS]:
-        if m.get("status") not in ("active", "open", "initialized"):
-            continue
-        p = mid_price(m)
-        if p is None or p <= 0:
-            continue
-        rows.append({
+        d = get(BASE + "/events/" + urllib.parse.quote(ticker))
+        return d.get("event") or {}
+    except Exception:
+        return {}
+
+
+def cat_of(title, raw_cat):
+    c = (raw_cat or "").lower()
+    t = (title or "").lower()
+    if "fed" in t or "fomc" in t or "interest rate" in t:
+        return "fomc"
+    if c in ("financials", "companies"):
+        return "equity" if c == "companies" else "rates"
+    if "cpi" in t or "inflation" in t or "gdp" in t or "payroll" in t or "unemployment" in t:
+        return "macro"
+    if "tariff" in t or "trade" in t:
+        return "trade"
+    if "oil" in t or "gold" in t or "copper" in t:
+        return "commodity"
+    return "macro"
+
+
+def fetch_events():
+    groups = scan_markets()
+    scored = []
+    for et, ms in groups.items():
+        vol = sum(m["_vol"] for m in ms)
+        scored.append((vol, et, ms))
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    out = []
+    for vol, et, ms in scored[:MAX_EVENTS]:
+        ms = sorted(ms, key=lambda m: m["_vol"], reverse=True)[:MAX_MARKETS]
+        meta = event_meta(et)
+        title = meta.get("title") or ms[0].get("title") or et
+        rows = [{
             "id": m.get("ticker") or "",
             "label": m.get("yes_sub_title") or m.get("subtitle") or "",
             "question": m.get("title") or "",
             "rules": (m.get("rules_primary") or "")[:1200],
-            "price": p,
+            "price": m["_p"],
             "change": None,
-            "volume": fnum(m.get("volume_24h_fp") or m.get("volume_fp")),
+            "volume": m["_vol"],
             "status": "open",
             "payout": None,
             "end": ts(m.get("close_time")),
+        } for m in ms]
+        out.append({
+            "id": et,
+            "slug": et,
+            "title": title,
+            "original": title,
+            "category": cat_of(title, meta.get("category")),
+            "status": "open",
+            "end": min([r["end"] for r in rows if r["end"]] or [None]) if any(r["end"] for r in rows) else None,
+            "volume": round(vol, 2),
+            "note": "",
+            "checked_at": int(time.time()),
+            "rows": rows,
         })
-    if not rows:
-        return None
-    cat = (ev.get("category") or "").strip().lower()
-    return {
-        "id": ticker,
-        "slug": ticker,
-        "title": ev.get("title") or ticker,
-        "original": ev.get("title") or "",
-        "category": CAT_MAP.get(cat, "macro"),
-        "status": "open",
-        "end": rows[0]["end"],
-        "volume": sum(r["volume"] for r in rows),
-        "note": "",
-        "checked_at": int(time.time()),
-        "rows": rows,
-    }
-
-
-def fetch_events():
-    cands = list_events(pages=2)[:60]
-    built = []
-    for ev in cands:
-        e = build_event(ev)
-        if e:
-            built.append(e)
-        if len(built) >= MAX_EVENTS * 2:      # 多抓一些，后面按成交量截断
-            break
-    built.sort(key=lambda e: e["volume"], reverse=True)
-    return built[:MAX_EVENTS]
+    return out
 
 
 def cmd_prices():
@@ -209,23 +218,34 @@ def cmd_prices():
 
 
 def series_of(ticker):
-    """KXFEDDECISION-26DEC-C25 → KXFEDDECISION"""
     return (ticker or "").split("-")[0]
+
+
+def candle_points(doc):
+    """K 线里取收盘价（分 → 概率）；没有成交就用买卖价中点"""
+    pts = []
+    for c in doc.get("candlesticks") or []:
+        t = c.get("end_period_ts")
+        if not t:
+            continue
+        v = None
+        pr = (c.get("price") or {}).get("close")
+        if pr:
+            v = float(pr) / 100.0
+        if not v:
+            bid = ((c.get("yes_bid") or {}).get("close") or 0)
+            ask = ((c.get("yes_ask") or {}).get("close") or 0)
+            if bid and ask:
+                v = (float(bid) + float(ask)) / 200.0
+        if v and v > 0:
+            pts.append([int(t), round(v, 4)])
+    return pts
 
 
 def candles(series, ticker, start, end, interval):
     url = "%s/series/%s/markets/%s/candlesticks?start_ts=%d&end_ts=%d&period_interval=%d" % (
         BASE, urllib.parse.quote(series), urllib.parse.quote(ticker), start, end, interval)
-    d = get(url)
-    pts = []
-    for c in d.get("candlesticks") or []:
-        t = c.get("end_period_ts")
-        pr = (c.get("price") or {}).get("close")
-        if t and pr is not None:
-            v = float(pr) / 100.0
-            if v > 0:
-                pts.append([int(t), round(v, 4)])
-    return pts
+    return candle_points(get(url))
 
 
 def cmd_history():
