@@ -7,11 +7,11 @@
     python3 fetch_pm.py history   # 合约走势        → data/history/<ticker>.json
 
 为什么用 Kalshi：Polymarket 的 gamma/clob 对机房 IP 有拦截（GitHub runner 直接被拒），
-Kalshi 是 CFTC 监管的交易所，公共读接口开放，有真实成交价。
+Kalshi 是 CFTC 监管的交易所，公共读接口开放，宏观系列有真实成交。
 
-策略：从**合约层**（/markets）翻页抓，按 24h 成交额分组到事件。
-这样能直接拿到 close_time 和成交量，不必逐个事件请求，也避免抓到一批
-到期在 2035 年、零成交的僵尸市场。
+为什么按「系列」抓：/markets 的全量目录被体育串关占满，翻页根本翻不到宏观市场；
+而 /events?series_ticker=...&with_nested_markets=true 一次就能带回该系列所有合约
+和买卖价、成交量。所以这里用系列白名单，命中宏观/利率类。
 
 只依赖标准库。Kalshi 限流较紧：串行 + 间隔 0.35s，429 按 Retry-After 退避。
 """
@@ -33,11 +33,15 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DATA = os.path.join(ROOT, "data")
 HIST = os.path.join(DATA, "history")
 
+# 系列名里出现这些词就算宏观/利率类
+KEEP_WORDS = ("FED", "FOMC", "CPI", "PCE", "GDP", "PAYROLL", "UNEMPLOY",
+              "INFLATION", "RECESSION", "RATE", "TARIFF", "JOBS", "RETAIL")
+
+MAX_SERIES = 18          # 最多抓多少个系列
 MAX_EVENTS = 24          # 最终保留多少个事件
 MAX_MARKETS = 6          # 每个事件最多取几个合约
 MAX_HISTORY = 20         # 历史只抓成交量前 N 个合约
 PACE = 0.35              # 请求间隔（秒）
-SCAN_PAGES = 8           # 合约层翻多少页（每页 200）
 
 _DBG_STARTED = [False]
 
@@ -107,97 +111,107 @@ def mid_price(m):
     return round(last, 4) if last > 0 else None
 
 
-def scan_markets(pages=SCAN_PAGES):
-    """翻页抓 open 合约，返回按 event_ticker 分组的字典"""
-    groups, cursor, total = {}, None, 0
-    for _ in range(pages):
-        url = BASE + "/markets?status=open&limit=200"
-        if cursor:
-            url += "&cursor=" + urllib.parse.quote(cursor)
-        d = get(url)
-        batch = d.get("markets") or []
-        total += len(batch)
-        for m in batch:
-            et = m.get("event_ticker") or ""
-            if not et or m.get("status") not in ("active", "open", "initialized"):
-                continue
-            p = mid_price(m)
-            if p is None or p <= 0:
-                continue
-            m["_p"] = p
-            m["_vol"] = fnum(m.get("volume_24h_fp") or m.get("volume_fp"))
-            groups.setdefault(et, []).append(m)
-        cursor = d.get("cursor")
-        if not cursor:
-            break
-    _dbg("scanned markets=%d events=%d" % (total, len(groups)))
-    return groups
-
-
-def event_meta(ticker):
-    """事件元数据；失败就返回空，不影响主流程"""
-    try:
-        d = get(BASE + "/events/" + urllib.parse.quote(ticker))
-        return d.get("event") or {}
-    except Exception:
-        return {}
-
-
-def cat_of(title, raw_cat):
-    c = (raw_cat or "").lower()
+def cat_of(title):
     t = (title or "").lower()
     if "fed" in t or "fomc" in t or "interest rate" in t:
         return "fomc"
-    if c in ("financials", "companies"):
-        return "equity" if c == "companies" else "rates"
-    if "cpi" in t or "inflation" in t or "gdp" in t or "payroll" in t or "unemployment" in t:
+    if "cpi" in t or "pce" in t or "gdp" in t or "payroll" in t or "unemploy" in t or "inflation" in t:
         return "macro"
     if "tariff" in t or "trade" in t:
         return "trade"
     if "oil" in t or "gold" in t or "copper" in t:
         return "commodity"
+    if "rate" in t:
+        return "rates"
     return "macro"
 
 
-def fetch_events():
-    groups = scan_markets()
-    scored = []
-    for et, ms in groups.items():
-        vol = sum(m["_vol"] for m in ms)
-        scored.append((vol, et, ms))
-    scored.sort(key=lambda x: x[0], reverse=True)
-
+def macro_series():
+    """拿 Economics 系列的 ticker 列表；失败则用内置白名单兜底"""
     out = []
-    for vol, et, ms in scored[:MAX_EVENTS]:
-        ms = sorted(ms, key=lambda m: m["_vol"], reverse=True)[:MAX_MARKETS]
-        meta = event_meta(et)
-        title = meta.get("title") or ms[0].get("title") or et
-        rows = [{
-            "id": m.get("ticker") or "",
-            "label": m.get("yes_sub_title") or m.get("subtitle") or "",
-            "question": m.get("title") or "",
-            "rules": (m.get("rules_primary") or "")[:1200],
-            "price": m["_p"],
-            "change": None,
-            "volume": m["_vol"],
-            "status": "open",
-            "payout": None,
-            "end": ts(m.get("close_time")),
-        } for m in ms]
+    try:
+        d = get(BASE + "/series?category=Economics")
+        for s in d.get("series") or []:
+            t = (s.get("ticker") or "").upper()
+            if t and any(w in t for w in KEEP_WORDS):
+                out.append(t)
+    except Exception as e:
+        _dbg("series list failed: %s" % str(e)[:80])
+    if not out:
+        out = ["KXFEDDECISION", "KXFED", "KXCPIYOY", "KXPAYROLLS", "KXGDPYOY",
+               "KXRECSSNBER", "KXUNEMPLOYMENT", "KXTARIFFS"]
+        _dbg("series fallback")
+    # 去重 + 限制数量
+    seen, uniq = set(), []
+    for t in out:
+        if t not in seen:
+            seen.add(t)
+            uniq.append(t)
+    _dbg("series=%d %s" % (len(uniq), ",".join(uniq[:MAX_SERIES])))
+    return uniq[:MAX_SERIES]
+
+
+def fetch_series_events(series):
+    """一个系列 → 其下所有 open 事件（带嵌套合约与报价）"""
+    d = get(BASE + "/events?status=open&series_ticker=%s&with_nested_markets=true"
+            % urllib.parse.quote(series))
+    out = []
+    for ev in d.get("events") or []:
+        rows = []
+        for m in ev.get("markets") or []:
+            if m.get("status") not in ("active", "open", "initialized"):
+                continue
+            vol = fnum(m.get("volume_fp"))
+            vol24 = fnum(m.get("volume_24h_fp"))
+            p = mid_price(m)
+            if p is None or p <= 0:
+                continue
+            if vol <= 0 and vol24 <= 0:
+                continue                      # 完全没成交的僵尸合约不要
+            rows.append({
+                "id": m.get("ticker") or "",
+                "label": m.get("yes_sub_title") or m.get("subtitle") or "",
+                "question": m.get("title") or "",
+                "rules": (m.get("rules_primary") or "")[:1200],
+                "price": p,
+                "change": None,
+                "volume": vol24 or vol,
+                "status": "open",
+                "payout": None,
+                "end": ts(m.get("close_time")),
+            })
+        if not rows:
+            continue
+        rows.sort(key=lambda r: r["volume"], reverse=True)
+        rows = rows[:MAX_MARKETS]
+        title = ev.get("title") or rows[0]["question"] or ev.get("event_ticker")
+        ends = [r["end"] for r in rows if r["end"]]
         out.append({
-            "id": et,
-            "slug": et,
+            "id": ev.get("event_ticker") or "",
+            "slug": ev.get("event_ticker") or "",
             "title": title,
             "original": title,
-            "category": cat_of(title, meta.get("category")),
+            "category": cat_of(title),
             "status": "open",
-            "end": min([r["end"] for r in rows if r["end"]] or [None]) if any(r["end"] for r in rows) else None,
-            "volume": round(vol, 2),
+            "end": min(ends) if ends else None,
+            "volume": round(sum(r["volume"] for r in rows), 2),
             "note": "",
             "checked_at": int(time.time()),
             "rows": rows,
         })
     return out
+
+
+def fetch_events():
+    built = []
+    for s in macro_series():
+        try:
+            built.extend(fetch_series_events(s))
+        except Exception as e:
+            _dbg("series %s failed: %s" % (s, str(e)[:80]))
+    _dbg("events built=%d" % len(built))
+    built.sort(key=lambda e: e["volume"], reverse=True)
+    return built[:MAX_EVENTS]
 
 
 def cmd_prices():
@@ -222,7 +236,6 @@ def series_of(ticker):
 
 
 def candle_points(doc):
-    """K 线里取收盘价（分 → 概率）；没有成交就用买卖价中点"""
     pts = []
     for c in doc.get("candlesticks") or []:
         t = c.get("end_period_ts")
