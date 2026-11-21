@@ -1,0 +1,49 @@
+name: pm-relay
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      history:
+        description: "同时抓历史走势（true / false）"
+        default: "false"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: pm-relay
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Prices
+        run: python3 relay/fetch_pm.py prices
+
+      - name: History
+        if: github.event.schedule == '0 */6 * * *' || inputs.history == 'true'
+        run: python3 relay/fetch_pm.py history
+
+      - name: Commit
+        run: |
+          git config user.name "pm-relay-bot"
+          git config user.email "pm-relay-bot@users.noreply.github.com"
+          git add data
+          if git diff --staged --quiet; then
+            echo "no change"
+            exit 0
+          fi
+          git commit -m "data $(date -u +%FT%TZ)"
+          for i in 1 2 3; do
+            git pull --rebase --autostash && git push && break || sleep 3
+          done
